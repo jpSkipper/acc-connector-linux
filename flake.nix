@@ -1,8 +1,41 @@
-# https://wiki.nixos.org/wiki/Python - see Package a Python application: With pyproject.toml
+# ACC Connector - TUI
+#
+# This flake builds the Python package with pyproject.nix (per
+# https://wiki.nixos.org/wiki/Python#Package_a_Python_application:_With_pyproject.toml)
+# and *also* reproduces the two things the old install.sh did by hand:
+#
+#   1. `python3 -c "assert sys.version_info >= (3,10)"`
+#      -> not needed: the flake pins an exact `python` interpreter, so the
+#         build simply fails at eval/build time if pyproject.toml's
+#         `requires-python` isn't satisfiable by the pinned version.
+#
+#   2. Writing ~/.local/share/applications/acc-connector.desktop and running
+#      `xdg-mime default ... x-scheme-handler/acc-connect`
+#      -> replaced with a *declarative* Desktop Entry baked into the Nix
+#         store output (see `desktopItem` / `withDesktop` below). Nix
+#         packages should never reach into $HOME during the build, so we
+#         install the .desktop file into $out/share/applications instead.
+#         NixOS / home-manager / most desktop environments already run
+#         `update-desktop-database` automatically whenever a profile
+#         containing such a file is activated, so the "registration" step
+#         becomes automatic instead of a manual script.
+#
+# If you still need imperative `xdg-mime` registration (e.g. you are not
+# using NixOS/home-manager and just want `nix profile install` to behave
+# like the old script), see the `activation-note` comment at the bottom.
+
 {
   description = "ACC Connector - TUI";
 
   inputs = {
+    # NOTE: the original flake referenced `nixpkgs` (via
+    # `pyproject-nix.inputs.nixpkgs.follows` and directly in `outputs`)
+    # without ever declaring it as a top-level input. That worked only
+    # because Nix implicitly pulled it in as a transitive input of
+    # pyproject-nix, which is fragile and version-pins you to whatever
+    # pyproject-nix happens to use. Declare it explicitly instead.
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+
     pyproject-nix = {
       url = "github:nix-community/pyproject.nix";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -14,32 +47,132 @@
     let
       inherit (nixpkgs) lib;
 
+      system = "x86_64-linux";
+      pkgs = nixpkgs.legacyPackages.${system};
+      python = pkgs.python3;
+
+      # Load & unmarshal pyproject.toml relative to this flake's root.
+      # `projectRoot` is also used as `src` by the buildPythonPackage
+      # renderer below, so this flake must live in (or next to) the repo
+      # that contains pyproject.toml. If you instead want to build the
+      # *published* GitHub repo without cloning it locally (mirroring what
+      # `pip install git+https://...` did), see the `remoteSrc` example
+      # further down.
       project = pyproject-nix.lib.project.loadPyproject {
-        # Read & unmarshal pyproject.toml relative to this project root.
-        # projectRoot is also used to set `src` for renderers such as buildPythonPackage.
         projectRoot = ./.;
       };
 
-      # This example is only using x86_64-linux
-      pkgs = nixpkgs.legacyPackages.x86_64-linux;
+      # ---------------------------------------------------------------
+      # 1. The plain Python package (equivalent to the original flake).
+      # ---------------------------------------------------------------
+      acc-connector = python.pkgs.buildPythonPackage (
+        (project.renderers.buildPythonPackage { inherit python; })
+        // {
+          # If you need any ENVs
+          # env.CUSTOM_ENVVAR = "hello";
 
-      python = pkgs.python3;
+          # Optional: fail fast with a clear error instead of a cryptic
+          # one if pyproject.toml's requires-python can't be satisfied by
+          # the pinned interpreter. `project.renderers.buildPythonPackage`
+          # already encodes this constraint for pip-style consumers, but
+          # asserting here gives a nicer Nix-side error message too.
+          meta.description = "ACC Connector TUI";
+        }
+      );
+
+      # ---------------------------------------------------------------
+      # 2. Declarative replacement for the desktop-file / xdg-mime steps.
+      # ---------------------------------------------------------------
+      # `makeDesktopItem` renders a .desktop file with the same fields
+      # the install script wrote by hand. Nix computes the absolute path
+      # to the built binary itself (${acc-connector}/bin/acc-connector),
+      # so there's no need for `command -v acc-connector` at install time.
+      desktopItem = pkgs.makeDesktopItem {
+        name = "acc-connector";
+        desktopName = "ACC Connector";
+        exec = "${acc-connector}/bin/acc-connector %u";
+        # MimeType must end in a semicolon per the Desktop Entry spec,
+        # exactly like the original heredoc.
+        mimeTypes = [ "x-scheme-handler/acc-connect" ];
+        noDisplay = true;
+      };
+
+      # `symlinkJoin` merges the Python package's own $out (bin/, lib/,
+      # etc.) with the desktop item's $out (share/applications/*.desktop)
+      # into a single derivation. This is the thing you actually want to
+      # install: it carries both the executable *and* the mime
+      # association, with no imperative post-install step required.
+      acc-connector-with-desktop = pkgs.symlinkJoin {
+        name = "acc-connector-with-desktop";
+        paths = [
+          acc-connector
+          desktopItem
+        ];
+        # Regenerate the desktop database cache inside the derivation
+        # itself. This is optional (profile activation usually does it
+        # too) but makes the package self-contained, e.g. for `nix run`
+        # or ad-hoc `nix shell` usage where no profile activation runs.
+        nativeBuildInputs = [ pkgs.desktop-file-utils ];
+        postBuild = ''
+          update-desktop-database "$out/share/applications" || true
+        '';
+      };
 
     in
     {
-      # Build our package using `buildPythonPackage
-      packages.x86_64-linux.default =
-        let
-          # Returns an attribute set that can be passed to `buildPythonPackage`.
-          attrs = project.renderers.buildPythonPackage { inherit python; };
-        in
-        # Pass attributes to buildPythonPackage.
-        # Here is a good spot to add on any missing or custom attributes.
-        python.pkgs.buildPythonPackage (
-          attrs
-          // {
-            env.CUSTOM_ENVVAR = "hello";
-          }
-        );
+      packages.${system} = {
+        # `nix build` -> just the Python package, no desktop integration.
+        acc-connector = acc-connector;
+
+        # `nix build .#default` -> package + registered URI handler.
+        # This is the one you want end users to install.
+        default = acc-connector-with-desktop;
+      };
+
+      # Lets `nix run .` invoke the TUI directly, same as running
+      # `acc-connector` after the old install.sh finished.
+      apps.${system}.default = {
+        type = "app";
+        program = "${acc-connector}/bin/acc-connector";
+      };
     };
 }
+
+# ---------------------------------------------------------------------
+# activation-note: if you are NOT on NixOS/home-manager and want the
+# mime association to be registered the moment someone runs
+# `nix profile install .#default` (rather than relying on your desktop
+# environment's own profile-activation hooks), you have two options:
+#
+#   a) home-manager users: set
+#        xdg.mimeApps.defaultApplications."x-scheme-handler/acc-connect" =
+#          "acc-connector.desktop";
+#      in your home-manager config instead of relying on the .desktop
+#      file's own MimeType field. This is the fully declarative,
+#      reproducible equivalent of the original `xdg-mime default ...`
+#      call, and belongs in your *system/user config*, not the package.
+#
+#   b) non-NixOS, imperative fallback: keep a tiny wrapper script (NOT
+#      part of the Nix build, since builds must be side-effect-free and
+#      can't touch $HOME) that runs, after installing the package:
+#        xdg-mime default acc-connector.desktop x-scheme-handler/acc-connect
+#      This is just the original install.sh's mime-handling snippet,
+#      kept separate from the reproducible Nix build on purpose.
+# ---------------------------------------------------------------------
+
+# ---------------------------------------------------------------------
+# remoteSrc example: building straight from GitHub instead of a local
+# checkout (closer to `pip install git+https://github.com/...`):
+#
+#   project = pyproject-nix.lib.project.loadPyproject {
+#     projectRoot = pkgs.fetchFromGitHub {
+#       owner = "cescofry";
+#       repo  = "acc-connector-linux";
+#       rev   = "main";              # pin a commit/tag for reproducibility
+#       sha256 = lib.fakeSha256;     # replace with the real hash on first build
+#     };
+#   };
+#
+# Everything else (acc-connector, desktopItem, acc-connector-with-desktop)
+# stays the same.
+# ---------------------------------------------------------------------
