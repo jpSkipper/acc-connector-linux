@@ -151,7 +151,7 @@
       #
       # ...and get the package + mime default with no manual step at all.
       homeModules.default =
-        { pkgs, ... }:
+        { pkgs, lib, ... }:
         {
           # Install the package. We use `acc-connector-with-desktop` (not
           # the bare `acc-connector`) so the .desktop file is present in
@@ -164,6 +164,18 @@
             enable = true;
             defaultApplications."x-scheme-handler/acc-connect" = "acc-connector.desktop";
           };
+
+          # Standalone home-manager on a non-NixOS distro does not, by
+          # itself, arrange for your graphical session to pick up
+          # `~/.nix-profile/share` in XDG_DATA_DIRS (or the profile's
+          # bin dir in PATH via a login shell). Without that, .desktop
+          # files installed above are invisible to your DE and to
+          # browsers resolving `acc-connect://` links, even though the
+          # binary runs fine from a shell that already has the profile's
+          # bin/ on PATH. `targets.genericLinux` wires up the session
+          # variables non-NixOS systems are missing. It's a no-op (and
+          # harmless) if you're on NixOS, where this is already handled.
+          targets.genericLinux.enable = lib.mkDefault true;
         };
     };
 }
