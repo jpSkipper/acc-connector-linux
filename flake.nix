@@ -68,8 +68,7 @@
       acc-connector = python.pkgs.buildPythonPackage (
         (project.renderers.buildPythonPackage { inherit python; })
         // {
-          # If you need any ENVs
-          # env.CUSTOM_ENVVAR = "hello";
+          env.CUSTOM_ENVVAR = "hello";
 
           # Optional: fail fast with a clear error instead of a cryptic
           # one if pyproject.toml's requires-python can't be satisfied by
@@ -135,6 +134,37 @@
         type = "app";
         program = "${acc-connector}/bin/acc-connector";
       };
+
+      # ---------------------------------------------------------------
+      # 3. home-manager module: installs the package *and* declares the
+      #    URI scheme association in one step.
+      # ---------------------------------------------------------------
+      # This is the fully declarative equivalent of the old install.sh:
+      # no `xdg-mime default ...` call is ever run, because home-manager
+      # writes the equivalent config (mimeapps.list) itself from this
+      # setting, every time the user's home-manager generation is
+      # activated. Users pull this in with:
+      #
+      #   { inputs, ... }: {
+      #     imports = [ inputs.acc-connector.homeModules.default ];
+      #   }
+      #
+      # ...and get the package + mime default with no manual step at all.
+      homeModules.default =
+        { pkgs, ... }:
+        {
+          # Install the package. We use `acc-connector-with-desktop` (not
+          # the bare `acc-connector`) so the .desktop file is present in
+          # the user's profile for launchers/menus, even though the mime
+          # default itself is now driven by `xdg.mimeApps` below rather
+          # than the .desktop file's own `MimeType=` field.
+          home.packages = [ acc-connector-with-desktop ];
+
+          xdg.mimeApps = {
+            enable = true;
+            defaultApplications."x-scheme-handler/acc-connect" = "acc-connector.desktop";
+          };
+        };
     };
 }
 
@@ -144,13 +174,18 @@
 # `nix profile install .#default` (rather than relying on your desktop
 # environment's own profile-activation hooks), you have two options:
 #
-#   a) home-manager users: set
+#   a) home-manager users: import `homeModules.default` from this flake
+#      instead of setting `xdg.mimeApps` by hand:
+#        { inputs, ... }: {
+#          imports = [ inputs.acc-connector.homeModules.default ];
+#        }
+#      That module installs the package AND sets
 #        xdg.mimeApps.defaultApplications."x-scheme-handler/acc-connect" =
 #          "acc-connector.desktop";
-#      in your home-manager config instead of relying on the .desktop
-#      file's own MimeType field. This is the fully declarative,
-#      reproducible equivalent of the original `xdg-mime default ...`
-#      call, and belongs in your *system/user config*, not the package.
+#      for you. This is the fully declarative, reproducible equivalent
+#      of the original `xdg-mime default ...` call — home-manager writes
+#      mimeapps.list itself on every activation, so there's no imperative
+#      step left at all.
 #
 #   b) non-NixOS, imperative fallback: keep a tiny wrapper script (NOT
 #      part of the Nix build, since builds must be side-effect-free and
